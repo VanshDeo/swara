@@ -149,8 +149,8 @@ flowchart TD
 | **M2b.1: Feature Parity & Contract Audit** | Synchronization of C and Python DSP (pre-emphasis 0.97, Hamming, natural log), numerical parity verification (max err < 0.05), and recording-level split contract | **Completed** | 2026-09-11 | Max abs err: 0.0172, zero leak across splits |
 | **M2c: Drive Dataset Import** | Google Drive dataset importer & audit tool (`import_drive_dataset.py`) for raw WAV ingestion | **Completed** | 2026-09-11 | Verified on test manifests; preserves original files |
 | **M2c.1: Training & TFLM Infrastructure** | Production-ready training loop (`train.py`), recording-level evaluation (`evaluate.py`), strict INT8 quantization (`quantize.py`), TFLite model inspector (`validate_tflite.py`), C-array exporter (`export_model_header.py`) | **Completed** | 2026-09-11 | 100% CTest pass (7/7) & infrastructure test pass (9/9). Zero fake data. |
-| **M2d: Real Model Training** | Train DS-CNN model on real Google Drive dataset once imported | Pending | - | Target high discriminative accuracy (>95%) |
-| **M3: INT8 Quantization** | Full INT8 calibration with real representative dataset, verify accuracy preservation | Pending | - | Export verified `swara_int8.tflite` |
+| **M2d: Real Model Training** | Train DS-CNN model on real Google Drive dataset with energy-aligned windowing and BatchNorm momentum fix | **Completed** | 2026-10-02 | 97.75% val accuracy, 93.14% test accuracy (92.3% swara recall) |
+| **M3: INT8 Quantization** | Full INT8 calibration with real representative dataset, verify accuracy preservation & export C++ arrays | **Completed** | 2026-10-02 | Exported `models/swara_int8.tflite` (25.3 KB) and `deployment/model_data.cc/h` |
 | **M4: Microcontroller Deployment** | TFLite Micro C++ integration, latency & memory profiling on target MCU | Pending | - | Target RAM $\le 256\text{ KB}$ |
 
 ---
@@ -173,8 +173,7 @@ flowchart TD
 | **Application State & Queues** | **ESTIMATED** | `~4,096 bytes` (~4.00 KB) | Classification event flags, IPC queues |
 | **TOTAL SYSTEM RAM (64-ch)** | **ESTIMATED** | **~122,912 bytes (~120.0 KB)**| **Complies with $\le 256\text{ KB}$ Limit (~136 KB Headroom)** |
 
-*Model weights (~12.2 KB for INT8 64-channel, or ~4.8 KB for INT8 32-channel) reside in Flash ROM (`alignas(16) const unsigned char g_swara_model_data[]`) and do not consume system RAM.*
-
+*Model weights (25.3 KB for full INT8 64-channel, 12.0 KB weight storage) reside in Flash ROM (`alignas(16) const unsigned char g_swara_model_data[]`) and do not consume system RAM.*
 
 ---
 
@@ -211,6 +210,13 @@ flowchart TD
 - **Decision:** Centralize model architecture defaults (`DEFAULT_NUM_FILTERS = 64`, `DEFAULT_NUM_CLASSES = 3`, `DEFAULT_INPUT_SHAPE = (49, 10, 1)`) in `training/config.py`, while defining exploration widths (`[16, 24, 32, 48, 64]`) for future candidate benchmarking.
 - **Rationale:** Enables seamless architectural comparisons between 64-channel baseline and lower-RAM candidates (such as 32 channels) across training, evaluation, and export pipelines without scattered manual edits.
 
+### ADR-009: Energy-Aligned Windowing and Fast-Converging BatchNorm for Small-Scale Edge Datasets
+- **Decision:** 
+  1. Implement peak energy sliding window search (step=320 samples / 20ms) for audio files longer than 1.0s, replacing blind center-cropping which truncated speech and generated false silent labels.
+  2. Set `BatchNormalization(momentum=0.80)` across all convolutional layers. On edge voice datasets with ~500-1000 samples (~15-30 batches/epoch), the default momentum (0.99) requires hundreds of epochs for moving statistics to converge, causing severe activation skew and uniform ~33% predictions in inference mode and TFLite weight-folding. Setting momentum to 0.80 aligns moving statistics with batch statistics in < 15 epochs, raising inference validation accuracy from 58% to 97.75%.
+  3. Explicitly decouple `Dense(3, activation=None, name="logits")` and `Softmax(name="output")` to maintain numerical stability during training and eliminate double-softmax ambiguity in downstream C++/Python monitors.
+- **Rationale:** Resolves the model non-responsiveness bug in `live_mic_test.py` and achieves 93.14% test accuracy with 92.3% recall on real Swara wake words.
+
 ---
 
 ## 6. Architecture Update Guidelines
@@ -228,6 +234,8 @@ When updating the architecture:
 
 | Date | Version | Author | Description of Changes |
 | :--- | :--- | :--- | :--- |
+| 2026-10-02 | v0.6.0 | Antigravity | Accomplished Milestones M2d & M3. Fixed BatchNorm momentum (0.80) to eliminate inference activation skew; resolved 2-softmax ambiguity with explicit logits + softmax layers; implemented peak energy sliding-window alignment (step=320) & multi-slice time-shift/noise data augmentations in `dataset.py`; filtered macOS `._*` AppleDouble ghost files; added 3-class visual percentage meter in `live_mic_test.py`; trained model achieving 97.75% val accuracy and 93.14% test accuracy (92.3% swara recall); exported 25.3 KB full INT8 model (`swara_int8.tflite`) and C++ arrays (`deployment/model_data.cc/h`). Added ADR-009. |
+| 2026-09-29 | v0.5.2 | Antigravity | Multi-class Drive import workflow & environment configuration. Added SILENCE_DRIVE_LINK and UNKNOWN_DRIVE_LINK to .env and .env.example; updated training/import_drive_dataset.py with dynamic class routing and --all batch downloading; configured dedicated .venv with TensorFlow 2.21, NumPy 1.26.4 (guaranteeing numpy<2 ABI stability), and gdown. |
 | 2026-09-11 | v0.5.1 | Antigravity | Hardened dataset ingestion against zero-frame/corrupt audio; implemented content-hash duplicate tracking across recording splits; created training/config.py for centralized channel width management; added ADR-007 and ADR-008; expanded unit tests covering missing classes, corrupt rejection, and flatbuffer header validation. |
 | 2026-09-11 | v0.5.0 | Antigravity | Implemented Milestone M2c.1: Training, Quantization & TFLM Infrastructure. Upgraded dataset loader with clean corrupt WAV rejection; hardened train.py, evaluate.py, and quantize.py to require real data and disallow zero/dummy data; created validate_tflite.py and export_model_header.py; confirmed DS-CNN 8-operator compatibility with TFLM; established comprehensive memory budget distinguishing measured C DSP RAM (60.4 KB) from estimated TFLM arena (~36.1 KB); all 7 C tests and 9 Python infrastructure tests passing. |
 | 2026-09-10 | v0.4.0 | Antigravity | Implemented Milestone M1b: Added energy-based VAD with hangover smoothing, native RIFF WAV parser (16kHz 16-bit mono), pre-emphasis (0.97), Hamming window, and complete 49x10 MFCC window extractor. Verified on silence, pure tone, and speech WAVs with 0.50 ms / 1s audio execution benchmark. Added ADR-006. |

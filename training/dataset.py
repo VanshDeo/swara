@@ -157,11 +157,16 @@ class SwaraDataset:
         self.target_duration = target_duration_samples
         self.feature_extractor = SwaraFeatureExtractor(use_preemphasis=use_preemphasis)
 
-    def load_wav_file(self, filepath: str) -> np.ndarray:
+    def load_raw_samples(self, filepath: str) -> np.ndarray:
         """
-        Loads and validates a 16kHz mono 16-bit PCM WAV file.
+        Loads unpadded, uncropped raw audio samples from 16kHz mono 16-bit PCM WAV.
         Rejects malformed headers, incorrect sample rate, channels, bit-depth, or zero-length cleanly.
         """
+        if not os.path.exists(filepath):
+            raise ValueError(f"{filepath}: File does not exist")
+        if os.path.getsize(filepath) < 44:
+            raise ValueError(f"{filepath}: File size too small for WAV header ({os.path.getsize(filepath)} bytes)")
+
         try:
             with wave.open(filepath, "rb") as wf:
                 channels = wf.getnchannels()
@@ -179,9 +184,32 @@ class SwaraDataset:
                     raise ValueError(f"{filepath}: Empty audio file (0 frames)")
 
                 raw_data = wf.readframes(num_frames)
-                samples = np.frombuffer(raw_data, dtype=np.int16)
+                return np.frombuffer(raw_data, dtype=np.int16)
         except (wave.Error, EOFError, struct.error) as e:
             raise ValueError(f"{filepath}: Malformed or corrupt WAV file: {e}")
+
+    @staticmethod
+    def find_peak_energy_window(samples: np.ndarray, window_size: int = 16000, step: int = 320) -> int:
+        """Find start index of window_size that has highest RMS energy using frame-step hop."""
+        if len(samples) <= window_size:
+            return 0
+        step = min(step, max(1, len(samples) - window_size))
+        best_start = 0
+        max_energy = -1.0
+        for s in range(0, len(samples) - window_size + 1, step):
+            chunk = samples[s : s + window_size].astype(np.float32)
+            energy = float(np.mean(chunk ** 2))
+            if energy > max_energy:
+                max_energy = energy
+                best_start = s
+        return best_start
+
+    def load_wav_file(self, filepath: str) -> np.ndarray:
+        """
+        Loads and validates a 16kHz mono 16-bit PCM WAV file.
+        Uses energy-aligned slicing for recordings longer than target duration (16,000 samples).
+        """
+        samples = self.load_raw_samples(filepath)
 
         # Normalize duration to 1.0 second (16000 samples)
         if len(samples) < self.target_duration:
@@ -189,7 +217,7 @@ class SwaraDataset:
             pad_right = self.target_duration - len(samples) - pad_left
             samples = np.pad(samples, (pad_left, pad_right), mode="constant", constant_values=0)
         elif len(samples) > self.target_duration:
-            start = (len(samples) - self.target_duration) // 2
+            start = self.find_peak_energy_window(samples, window_size=self.target_duration)
             samples = samples[start : start + self.target_duration]
 
         return samples
@@ -227,8 +255,7 @@ class SwaraDataset:
         """
         Scan data_dir for class subdirectories and assign each file deterministically
         via recording-level splitting.
-        If deduplicate_by_content is True, identical duplicate recordings are identified
-        by content hash and kept in the same split or ignored to prevent data leakage.
+        Strictly ignores AppleDouble (._*) and hidden files.
         """
         splits: Dict[str, List[Tuple[str, int, Optional[str]]]] = {"train": [], "val": [], "test": []}
         seen_content_hashes: Dict[str, str] = {}  # hash -> split_name
@@ -242,29 +269,31 @@ class SwaraDataset:
                 else:
                     continue
 
-            for root, _, files in os.walk(class_dir):
+            for root, dirs, files in os.walk(class_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for f in sorted(files):
-                    if f.lower().endswith(".wav"):
-                        path = os.path.join(root, f)
+                    if f.startswith(".") or f.startswith("._") or not f.lower().endswith(".wav"):
+                        continue
+                    path = os.path.join(root, f)
 
-                        if deduplicate_by_content:
-                            try:
-                                c_hash = self.get_file_content_hash(path)
-                                if c_hash in seen_content_hashes:
-                                    # Duplicate found! Assign to SAME split as original to prevent train/val leakage
-                                    target_split = seen_content_hashes[c_hash]
-                                    splits[target_split].append((path, class_idx, None))
-                                    continue
-                                else:
-                                    target_split = self.get_recording_split(f)
-                                    seen_content_hashes[c_hash] = target_split
-                                    splits[target_split].append((path, class_idx, None))
-                            except Exception:
-                                target_split = self.get_recording_split(f)
+                    if deduplicate_by_content:
+                        try:
+                            c_hash = self.get_file_content_hash(path)
+                            if c_hash in seen_content_hashes:
+                                # Duplicate found! Assign to SAME split as original to prevent train/val leakage
+                                target_split = seen_content_hashes[c_hash]
                                 splits[target_split].append((path, class_idx, None))
-                        else:
-                            split = self.get_recording_split(f)
-                            splits[split].append((path, class_idx, None))
+                                continue
+                            else:
+                                target_split = self.get_recording_split(f)
+                                seen_content_hashes[c_hash] = target_split
+                                splits[target_split].append((path, class_idx, None))
+                        except Exception:
+                            target_split = self.get_recording_split(f)
+                            splits[target_split].append((path, class_idx, None))
+                    else:
+                        split = self.get_recording_split(f)
+                        splits[split].append((path, class_idx, None))
 
         return splits
 
@@ -281,6 +310,7 @@ class SwaraDataset:
     def load_tensors_from_file_list(
         self,
         file_entries: List[Tuple[str, int, Optional[str]]],
+        augment_swara: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         num_samples = len(file_entries)
         if num_samples == 0:
@@ -291,13 +321,70 @@ class SwaraDataset:
 
         valid_X = []
         valid_y = []
+        rng = np.random.RandomState(42)
 
         for fpath, class_idx, _ in file_entries:
             try:
-                audio = self.load_wav_file(fpath)
-                features = self.feature_extractor.extract_window_mfcc(audio)
-                valid_X.append(features)
-                valid_y.append(class_idx)
+                raw_samples = self.load_raw_samples(fpath)
+                swara_class_idx = CLASS_TO_IDX["swara"]
+                unknown_class_idx = CLASS_TO_IDX["unknown"]
+
+                if augment_swara and class_idx == swara_class_idx:
+                    # Multi-slice & jitter augmentation for swara wake word
+                    if len(raw_samples) > self.target_duration:
+                        best_start = self.find_peak_energy_window(raw_samples, window_size=self.target_duration, step=320)
+                        offsets = [0, -1200, +1200, -2400, +2400]
+                        for off in offsets:
+                            s = best_start + off
+                            if 0 <= s and s + self.target_duration <= len(raw_samples):
+                                chunk = raw_samples[s : s + self.target_duration].copy()
+                                features = self.feature_extractor.extract_window_mfcc(chunk)
+                                valid_X.append(features)
+                                valid_y.append(class_idx)
+
+                                # Mild noise injection on center peak slice (SNR ~25dB)
+                                if off == 0:
+                                    noise = rng.normal(0, 20.0, self.target_duration).astype(np.float32)
+                                    noisy_chunk = np.clip(chunk.astype(np.float32) + noise, -32768, 32767).astype(np.int16)
+                                    n_features = self.feature_extractor.extract_window_mfcc(noisy_chunk)
+                                    valid_X.append(n_features)
+                                    valid_y.append(class_idx)
+                    else:
+                        # Audio <= 1.0s: center pad
+                        audio = self.load_wav_file(fpath)
+                        valid_X.append(self.feature_extractor.extract_window_mfcc(audio))
+                        valid_y.append(class_idx)
+
+                        # Small time shifts with zero padding
+                        for shift in [-800, 800]:
+                            shifted = np.roll(audio, shift)
+                            if shift > 0:
+                                shifted[:shift] = 0
+                            else:
+                                shifted[shift:] = 0
+                            valid_X.append(self.feature_extractor.extract_window_mfcc(shifted))
+                            valid_y.append(class_idx)
+
+                elif augment_swara and class_idx == unknown_class_idx and len(raw_samples) >= (self.target_duration * 2):
+                    # Multi-slice for long negative/unknown speech to balance vocabulary
+                    s1 = self.find_peak_energy_window(raw_samples, window_size=self.target_duration, step=320)
+                    chunk1 = raw_samples[s1 : s1 + self.target_duration]
+                    valid_X.append(self.feature_extractor.extract_window_mfcc(chunk1))
+                    valid_y.append(class_idx)
+
+                    # Second slice at least 1 second away if available
+                    rem_start = s1 + self.target_duration
+                    if rem_start + self.target_duration <= len(raw_samples):
+                        chunk2 = raw_samples[rem_start : rem_start + self.target_duration]
+                        if np.sqrt(np.mean(chunk2.astype(np.float32) ** 2)) > 300.0:
+                            valid_X.append(self.feature_extractor.extract_window_mfcc(chunk2))
+                            valid_y.append(class_idx)
+                else:
+                    audio = self.load_wav_file(fpath)
+                    features = self.feature_extractor.extract_window_mfcc(audio)
+                    valid_X.append(features)
+                    valid_y.append(class_idx)
+
             except ValueError as e:
                 print(f"[Warning] Skipping invalid/corrupt audio file {fpath}: {e}")
 
@@ -343,10 +430,12 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
         return report
 
     all_wavs = []
-    for root, _, files in os.walk(data_dir):
+    for root, dirs, files in os.walk(data_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for f in sorted(files):
-            if f.lower().endswith(".wav"):
-                all_wavs.append(os.path.join(root, f))
+            if f.startswith(".") or f.startswith("._") or not f.lower().endswith(".wav"):
+                continue
+            all_wavs.append(os.path.join(root, f))
 
     report["total_wav_files"] = len(all_wavs)
     if len(all_wavs) == 0:

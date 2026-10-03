@@ -95,8 +95,8 @@ def train(
 
     # Load audio features
     print("\nExtracting 49x10 MFCC features for train and val splits...")
-    X_train, y_train = dataset_loader.load_tensors_from_file_list(splits["train"])
-    X_val, y_val = dataset_loader.load_tensors_from_file_list(splits["val"])
+    X_train, y_train = dataset_loader.load_tensors_from_file_list(splits["train"], augment_swara=True)
+    X_val, y_val = dataset_loader.load_tensors_from_file_list(splits["val"], augment_swara=False)
 
     print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
     print(f"X_val shape:   {X_val.shape}, y_val shape:   {y_val.shape}")
@@ -122,25 +122,43 @@ def train(
         return model, None
 
     # Checkpoint and history logging
-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    checkpoint_filepath = os.path.join(save_path, "best_val_model.keras")
+    save_dir = os.path.dirname(save_path) if (save_path.endswith(".keras") or "." in os.path.basename(save_path)) else save_path
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_filepath = os.path.join(save_dir, "best_val_model.keras")
+
+    # Balanced class weights to handle dataset class imbalance
+    class_counts = {c: int(np.sum(y_train == c)) for c in range(len(CLASSES))}
+    total_train = len(y_train)
+    class_weights = {
+        c: float(total_train) / (len(CLASSES) * max(1, count))
+        for c, count in class_counts.items()
+    }
+    print(f"Class distribution in train split: {class_counts}")
+    print(f"Computed balanced class weights: {class_weights}")
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_filepath,
-            monitor="val_accuracy",
-            mode="max",
+            monitor="val_loss",
+            mode="min",
             save_best_only=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=4,
+            min_lr=1e-5,
             verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=10,
+            patience=12,
             restore_best_weights=True,
             verbose=1,
         ),
         tf.keras.callbacks.CSVLogger(
-            filename=os.path.join(os.path.dirname(save_path) or ".", "training_history.csv"),
+            filename=os.path.join(save_dir, "training_history.csv"),
             separator=",",
             append=False,
         ),
@@ -153,12 +171,34 @@ def train(
         validation_data=(X_val, y_val),
         epochs=epochs,
         batch_size=batch_size,
+        class_weight=class_weights,
         callbacks=callbacks,
         shuffle=True,
     )
 
-    print(f"\nTraining completed. Exporting final model to {save_path}...")
-    model.save(save_path)
+    if os.path.exists(checkpoint_filepath):
+        try:
+            best_model = tf.keras.models.load_model(checkpoint_filepath)
+            val_loss_current, val_acc_current = model.evaluate(X_val, y_val, verbose=0)
+            val_loss_best, val_acc_best = best_model.evaluate(X_val, y_val, verbose=0)
+            print(f"Final epoch val_loss: {val_loss_current:.4f} (acc: {val_acc_current*100:.2f}%)")
+            print(f"Best checkpoint val_loss: {val_loss_best:.4f} (acc: {val_acc_best*100:.2f}%)")
+            if val_loss_best <= val_loss_current:
+                print(f"Selecting best checkpoint (val_loss: {val_loss_best:.4f}, val_accuracy: {val_acc_best*100:.2f}%) for export.")
+                model = best_model
+        except Exception as e:
+            print(f"[Note] Checkpoint selection note: {e}")
+
+    keras_save_path = save_path if save_path.endswith(".keras") else f"{save_path}.keras"
+    print(f"\nTraining completed. Exporting final model to {keras_save_path}...")
+    model.save(keras_save_path)
+    try:
+        if not save_path.endswith(".keras"):
+            model.export(save_path)
+            print(f"Exported SavedModel to {save_path}")
+    except Exception as e:
+        print(f"[Note] SavedModel bundle export note: {e}")
+
     return model, history
 
 

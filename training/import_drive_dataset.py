@@ -23,6 +23,8 @@ import hashlib
 import datetime
 import json
 import re
+import time
+import requests
 from typing import Dict, List, Any, Optional, Tuple
 
 
@@ -120,9 +122,44 @@ def inspect_wav_header(filepath: str) -> Dict[str, Any]:
     return res
 
 
+def download_file_from_google_drive(file_id: str, destination: str, session: Optional[Any] = None, max_retries: int = 3) -> bool:
+    """Download single file from Google Drive via direct streaming with virus warning bypass and retries."""
+    if os.path.exists(destination) and os.path.getsize(destination) > 44:
+        return True
+
+    sess = session or requests.Session()
+    url = "https://drive.google.com/uc?export=download"
+    for attempt in range(max_retries):
+        try:
+            resp = sess.get(url, params={"id": file_id}, stream=True, timeout=30)
+            for k, v in resp.cookies.items():
+                if k.startswith("download_warning"):
+                    resp = sess.get(url, params={"id": file_id, "confirm": v}, stream=True, timeout=30)
+                    break
+            if "Google Drive - Virus scan warning" in resp.text:
+                match = re.search(r"confirm=([0-9A-Za-z_]+)", resp.text)
+                if match:
+                    resp = sess.get(url, params={"id": file_id, "confirm": match.group(1)}, stream=True, timeout=30)
+            if resp.status_code == 200:
+                os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
+                temp_dest = destination + ".tmp"
+                with open(temp_dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(temp_dest, destination)
+                return True
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"[Warning] Failed downloading file {file_id}: {e}")
+            time.sleep(1)
+    return False
+
+
 def download_google_drive_folder(folder_id_or_url: str, staging_dir: str) -> str:
     """
-    Download a Google Drive folder using gdown into a read-only staging directory.
+    Download a Google Drive folder into a read-only staging directory.
+    Uses gdown to query folder structure and resilient direct streaming to download reliably.
     Source Drive files are never modified or renamed.
     """
     try:
@@ -131,7 +168,7 @@ def download_google_drive_folder(folder_id_or_url: str, staging_dir: str) -> str
         raise RuntimeError("gdown is required to download from Google Drive URL/ID. Run: pip install gdown")
 
     os.makedirs(staging_dir, exist_ok=True)
-    print(f"[DRIVE] Downloading Google Drive folder to staging area: {staging_dir}...")
+    print(f"[DRIVE] Syncing Google Drive folder to staging area: {staging_dir}...")
 
     # Extract ID if a full URL was passed
     folder_url = folder_id_or_url
@@ -141,23 +178,52 @@ def download_google_drive_folder(folder_id_or_url: str, staging_dir: str) -> str
             folder_id = match.group(1)
             folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
 
-    gdown.download_folder(url=folder_url, output=staging_dir, quiet=False, use_cookies=False)
+    # Discover folder contents without downloading
+    try:
+        files = gdown.download_folder(url=folder_url, output=staging_dir, skip_download=True, quiet=True)
+    except Exception as e:
+        print(f"[DRIVE] Note on metadata listing: {e}. Trying direct gdown sync...")
+        gdown.download_folder(url=folder_url, output=staging_dir, quiet=False, use_cookies=False, resume=True)
+        return staging_dir
+
+    if not files:
+        print(f"[DRIVE] No files found in folder {folder_url}.")
+        return staging_dir
+
+    print(f"[DRIVE] Folder contains {len(files)} files. Syncing to staging...")
+    session = requests.Session()
+    for idx, item in enumerate(files, 1):
+        dest_path = os.path.join(staging_dir, item.path)
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 44:
+            continue
+        print(f"[{idx}/{len(files)}] Downloading {item.path}...")
+        success = download_file_from_google_drive(item.id, dest_path, session)
+        if not success:
+            try:
+                gdown.download(id=item.id, output=dest_path, quiet=True)
+            except Exception:
+                pass
+
     return staging_dir
 
 
 def import_dataset(
     source: str,
-    dest_dir: str = "data/raw/swara",
+    dest_dir: Optional[str] = None,
+    dataset_label: str = "swara",
     drive_file_id: Optional[str] = None,
     staging_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main dataset import workflow.
     - source: Can be a local folder path OR a Google Drive URL / Folder ID.
-    - dest_dir: Destination folder for imported files (default: data/raw/swara).
+    - dest_dir: Destination folder for imported files (default: data/raw/<dataset_label>).
+    - dataset_label: Dataset class label ('swara', 'silence', or 'unknown').
     - Returns: Import audit report dictionary.
     """
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if dest_dir is None:
+        dest_dir = f"data/raw/{dataset_label}"
     os.makedirs(dest_dir, exist_ok=True)
 
     # 1. Resolve source location
@@ -169,7 +235,7 @@ def import_dataset(
     actual_source_dir = source
     if source_is_remote_drive:
         if staging_dir is None:
-            staging_dir = os.path.abspath(os.path.join(dest_dir, "..", ".gdrive_staging"))
+            staging_dir = os.path.abspath(os.path.join(dest_dir, "..", f".gdrive_staging_{dataset_label}"))
         actual_source_dir = download_google_drive_folder(source, staging_dir)
 
     if not os.path.exists(actual_source_dir):
@@ -234,7 +300,7 @@ def import_dataset(
                 "sha256": sha256_hash,
                 "file_size_bytes": file_size,
                 "import_timestamp": timestamp,
-                "dataset_label": "swara",
+                "dataset_label": dataset_label,
                 "speaker_id": "unknown",
                 "is_valid_wav": False,
                 "error": hdr["error"],
@@ -279,7 +345,7 @@ def import_dataset(
                 "sha256": sha256_hash,
                 "file_size_bytes": file_size,
                 "import_timestamp": timestamp,
-                "dataset_label": "swara",
+                "dataset_label": dataset_label,
                 "speaker_id": "unknown",
                 "is_valid_wav": True,
                 "format": hdr,
@@ -311,7 +377,7 @@ def import_dataset(
             "sha256": sha256_hash,
             "file_size_bytes": file_size,
             "import_timestamp": timestamp,
-            "dataset_label": "swara",
+            "dataset_label": dataset_label,
             "speaker_id": "unknown",  # PRESERVED AS UNKNOWN
             "is_valid_wav": True,
             "format": hdr,
@@ -330,7 +396,7 @@ def import_dataset(
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest_entries, f, indent=2)
 
-    root_manifest_path = os.path.join(os.path.dirname(dest_dir), "swara_manifest.json")
+    root_manifest_path = os.path.join(os.path.dirname(dest_dir), f"{dataset_label}_manifest.json")
     with open(root_manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest_entries, f, indent=2)
 
@@ -364,44 +430,137 @@ def import_dataset(
     return report
 
 
+DATASET_ENV_CONFIG = {
+    "swara": {
+        "env_keys": [
+            "SWARA_DRIVE_LINK",
+            "GOOGLE_DRIVE_LINK",
+            "GOOGLE_DRIVE_SWARA_LINK",
+            "GDRIVE_SWARA_URL",
+            "GDRIVE_DATASET_URL",
+            "SWARA_GDRIVE_URL",
+            "GDRIVE_URL",
+        ],
+        "folder_id_keys": ["GOOGLE_DRIVE_FOLDER_ID", "GDRIVE_FOLDER_ID", "SWARA_FOLDER_ID"],
+        "default_dest": "data/raw/swara",
+    },
+    "silence": {
+        "env_keys": [
+            "SILENCE_DRIVE_LINK",
+            "GOOGLE_DRIVE_SILENCE_LINK",
+            "GDRIVE_SILENCE_URL",
+            "GDRIVE_SILENCE_LINK",
+            "SILENCE_GDRIVE_URL",
+        ],
+        "folder_id_keys": ["SILENCE_FOLDER_ID", "GOOGLE_DRIVE_SILENCE_FOLDER_ID"],
+        "default_dest": "data/raw/silence",
+    },
+    "unknown": {
+        "env_keys": [
+            "UNKNOWN_DRIVE_LINK",
+            "GOOGLE_DRIVE_UNKNOWN_LINK",
+            "GDRIVE_UNKNOWN_URL",
+            "GDRIVE_UNKNOWN_LINK",
+            "UNKNOWN_GDRIVE_URL",
+        ],
+        "folder_id_keys": ["UNKNOWN_FOLDER_ID", "GOOGLE_DRIVE_UNKNOWN_FOLDER_ID"],
+        "default_dest": "data/raw/unknown",
+    },
+}
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Swara Google Drive Dataset Import Tool")
-    parser.add_argument("--source", type=str, default=None, help="Local directory path OR Google Drive folder URL/ID (defaults to .env)")
-    parser.add_argument("--dest_dir", type=str, default="data/raw/swara", help="Destination folder (default: data/raw/swara)")
+    parser.add_argument("--source", type=str, default=None, help="Local directory path OR Google Drive folder URL/ID")
+    parser.add_argument("--class_name", type=str, default=None, choices=["swara", "silence", "unknown"], help="Dataset class label ('swara', 'silence', or 'unknown')")
+    parser.add_argument("--all", action="store_true", help="Import all configured classes from .env")
+    parser.add_argument("--dest_dir", type=str, default=None, help="Destination folder (default: data/raw/<class_name>)")
     parser.add_argument("--drive_file_id", type=str, default=None, help="Optional Google Drive folder or file ID for manifest metadata")
     parser.add_argument("--env_file", type=str, default=".env", help="Path to .env file (default: .env)")
     args = parser.parse_args()
 
+    env_vars = load_env_file(args.env_file)
+
+    def resolve_source_for_class(cls: str) -> Tuple[Optional[str], Optional[str]]:
+        cfg = DATASET_ENV_CONFIG.get(cls, {})
+        src = None
+        d_id = None
+        for key in cfg.get("env_keys", []):
+            val = env_vars.get(key) or os.environ.get(key)
+            if val and val.strip() and not val.strip().startswith("YOUR_"):
+                src = val.strip()
+                break
+        for key in cfg.get("folder_id_keys", []):
+            val = env_vars.get(key) or os.environ.get(key)
+            if val and val.strip():
+                d_id = val.strip()
+                break
+        return src, d_id
+
+    # If --all or neither --source nor --class_name specified
+    if args.all or (args.source is None and args.class_name is None):
+        classes_to_import = []
+        for cls_name in ["swara", "silence", "unknown"]:
+            src, d_id = resolve_source_for_class(cls_name)
+            if src:
+                classes_to_import.append((cls_name, src, d_id))
+
+        if not classes_to_import:
+            print("ERROR: No valid dataset sources configured in environment or CLI!")
+            print(f"Please specify --source on CLI or configure your Google Drive links in {args.env_file}:")
+            print("  - GOOGLE_DRIVE_LINK (or SWARA_DRIVE_LINK) for 'swara'")
+            print("  - SILENCE_DRIVE_LINK for 'silence'")
+            print("  - UNKNOWN_DRIVE_LINK for 'unknown'")
+            sys.exit(1)
+
+        print("==================================================================")
+        print("           Swara Google Drive Dataset Import Workflow             ")
+        print(f"  Target Classes to Import: {[c[0] for c in classes_to_import]}")
+        print("==================================================================")
+
+        for cls_name, src, d_id in classes_to_import:
+            dst = os.path.join("data/raw", cls_name)
+            print(f"\n---> Importing Class: [{cls_name.upper()}] from {src}")
+            report = import_dataset(
+                source=src,
+                dest_dir=dst,
+                dataset_label=cls_name,
+                drive_file_id=d_id,
+            )
+            print(f"Imported {report['successfully_imported']} files ({report['duplicate_files']} duplicates skipped).")
+            print(f"Manifest written: {report['manifest_path']}")
+        print("\nAll configured datasets imported successfully!")
+        return
+
+    # Specific class or specific source provided
+    cls_name = args.class_name or "swara"
     source = args.source
     drive_id = args.drive_file_id
 
-    # If source is not provided via CLI, resolve from .env or system environment
     if not source:
-        env_vars = load_env_file(args.env_file)
-        for key in ["GOOGLE_DRIVE_LINK", "GDRIVE_DATASET_URL", "SWARA_GDRIVE_URL", "GDRIVE_URL", "GOOGLE_DRIVE_FOLDER_ID", "GDRIVE_FOLDER_ID"]:
-            val = env_vars.get(key) or os.environ.get(key)
-            if val:
-                source = val
-                if not drive_id:
-                    drive_id = env_vars.get("GDRIVE_FOLDER_ID") or os.environ.get("GDRIVE_FOLDER_ID")
-                print(f"[CONFIG] Loaded source from {args.env_file} (key: {key})")
-                break
+        src, d_id = resolve_source_for_class(cls_name)
+        source = src
+        if not drive_id:
+            drive_id = d_id
 
     if not source:
-        print("ERROR: No dataset source specified!")
-        print(f"Please specify --source on CLI or configure GOOGLE_DRIVE_LINK in {args.env_file}")
+        print(f"ERROR: No dataset source found for class '{cls_name}'!")
+        print(f"Please configure {cls_name.upper()}_DRIVE_LINK in {args.env_file} or pass --source <link>.")
         sys.exit(1)
 
+    dest_dir = args.dest_dir or os.path.join("data/raw", cls_name)
     print("==================================================================")
     print("           Swara Google Drive Dataset Import Workflow             ")
     print("==================================================================")
+    print(f"Class:       {cls_name}")
     print(f"Source:      {source}")
-    print(f"Destination: {args.dest_dir}\n")
+    print(f"Destination: {dest_dir}\n")
 
     report = import_dataset(
         source=source,
-        dest_dir=args.dest_dir,
+        dest_dir=dest_dir,
+        dataset_label=cls_name,
         drive_file_id=drive_id,
     )
 

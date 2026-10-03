@@ -118,3 +118,4 @@ ENV/
 .env
 .env.*
 !.env.example
+._*
