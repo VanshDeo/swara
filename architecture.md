@@ -79,7 +79,9 @@ swara/
 ├── data/               # Offline training & validation datasets
 │   ├── raw/
 │   ├── processed/
-│   └── augmented/
+├── tools/              # Offline developer utilities & visualization
+│   ├── dashboard.py    # Interactive CLI dashboard (audit, explore channels, benchmarks, parity)
+│   └── wav_visualizer/ # Windows desktop WAV & MFCC inspection GUI
 │
 ├── CMakeLists.txt      # Root build configuration for runtime & test suites
 ├── architecture.md     # Architecture specifications, hard constraints & change log
@@ -236,6 +238,7 @@ When updating the architecture:
 | :--- | :--- | :--- | :--- |
 | 2026-10-02 | v0.6.0 | Antigravity | Accomplished Milestones M2d & M3. Fixed BatchNorm momentum (0.80) to eliminate inference activation skew; resolved 2-softmax ambiguity with explicit logits + softmax layers; implemented peak energy sliding-window alignment (step=320) & multi-slice time-shift/noise data augmentations in `dataset.py`; filtered macOS `._*` AppleDouble ghost files; added 3-class visual percentage meter in `live_mic_test.py`; trained model achieving 97.75% val accuracy and 93.14% test accuracy (92.3% swara recall); exported 25.3 KB full INT8 model (`swara_int8.tflite`) and C++ arrays (`deployment/model_data.cc/h`). Added ADR-009. |
 | 2026-09-29 | v0.5.2 | Antigravity | Multi-class Drive import workflow & environment configuration. Added SILENCE_DRIVE_LINK and UNKNOWN_DRIVE_LINK to .env and .env.example; updated training/import_drive_dataset.py with dynamic class routing and --all batch downloading; configured dedicated .venv with TensorFlow 2.21, NumPy 1.26.4 (guaranteeing numpy<2 ABI stability), and gdown. |
+| 2026-09-12 | v0.6.0 | Antigravity | Added tools/dashboard.py: Rich terminal-based interactive dashboard to explore the Swara pipeline, compare DS-CNN architecture channel widths against the <= 256 KB RAM budget, audit datasets, run C benchmarks and parity tests, and simulate dry-run training. |
 | 2026-09-11 | v0.5.1 | Antigravity | Hardened dataset ingestion against zero-frame/corrupt audio; implemented content-hash duplicate tracking across recording splits; created training/config.py for centralized channel width management; added ADR-007 and ADR-008; expanded unit tests covering missing classes, corrupt rejection, and flatbuffer header validation. |
 | 2026-09-11 | v0.5.0 | Antigravity | Implemented Milestone M2c.1: Training, Quantization & TFLM Infrastructure. Upgraded dataset loader with clean corrupt WAV rejection; hardened train.py, evaluate.py, and quantize.py to require real data and disallow zero/dummy data; created validate_tflite.py and export_model_header.py; confirmed DS-CNN 8-operator compatibility with TFLM; established comprehensive memory budget distinguishing measured C DSP RAM (60.4 KB) from estimated TFLM arena (~36.1 KB); all 7 C tests and 9 Python infrastructure tests passing. |
 | 2026-09-10 | v0.4.0 | Antigravity | Implemented Milestone M1b: Added energy-based VAD with hangover smoothing, native RIFF WAV parser (16kHz 16-bit mono), pre-emphasis (0.97), Hamming window, and complete 49x10 MFCC window extractor. Verified on silence, pure tone, and speech WAVs with 0.50 ms / 1s audio execution benchmark. Added ADR-006. |

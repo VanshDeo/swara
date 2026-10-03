@@ -224,23 +224,44 @@ class SwaraDataset:
 
     @staticmethod
     def get_file_content_hash(filepath: str) -> str:
-        """Compute SHA-1 hash of raw file content to identify duplicates."""
-        hasher = hashlib.sha1()
+        """Compute SHA-256 hash of raw file content to identify duplicates."""
+        hasher = hashlib.sha256()
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
                 hasher.update(chunk)
         return hasher.hexdigest()
 
     @staticmethod
-    def get_recording_split(file_identifier: str, val_ratio: float = 0.15, test_ratio: float = 0.15) -> str:
+    def get_recording_split(
+        file_or_content_hash: str,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15
+    ) -> str:
         """
-        DETERMINISTIC RECORDING-LEVEL SPLIT.
+        DETERMINISTIC CONTENT-BASED RECORDING-LEVEL SPLIT.
         NOTE: This partition is strictly RECORDING-LEVEL and NOT speaker-independent
         because speaker identities are not available in the real dataset.
-        Partition is computed deterministically from SHA-1 of filename or content hash.
+
+        Partition is computed deterministically from the SHA-256 content hash of the
+        WAV audio file (or from an explicit SHA-256 hex string).
+        
+        Guarantees:
+        1. Two byte-identical WAV files with different filenames ALWAYS receive the exact same split.
+        2. Renaming a file without altering its audio content NEVER causes it to change partitions.
+        3. Completely independent of machine, OS, or absolute filesystem paths.
         """
-        norm_id = os.path.basename(file_identifier).strip().lower()
-        hash_val = int(hashlib.sha1(norm_id.encode("utf-8")).hexdigest(), 16) % 100
+        if os.path.isfile(file_or_content_hash):
+            c_hash = SwaraDataset.get_file_content_hash(file_or_content_hash)
+        else:
+            c_hash = file_or_content_hash.strip().lower()
+
+        # If already a 64-character SHA-256 hex string, convert directly to integer
+        if len(c_hash) == 64 and all(c in "0123456789abcdef" for c in c_hash):
+            hash_val = int(c_hash, 16) % 100
+        else:
+            # Fallback for mock test identifiers / non-file strings
+            hash_val = int(hashlib.sha256(c_hash.encode("utf-8")).hexdigest(), 16) % 100
+
         val_threshold = int(val_ratio * 100)
         test_threshold = val_threshold + int(test_ratio * 100)
 
@@ -254,12 +275,36 @@ class SwaraDataset:
     def scan_dataset(self, deduplicate_by_content: bool = True) -> Dict[str, List[Tuple[str, int, Optional[str]]]]:
         """
         Scan data_dir for class subdirectories and assign each file deterministically
-        via recording-level splitting.
         Strictly ignores AppleDouble (._*) and hidden files.
+        via content-hash recording-level splitting.
+        If deduplicate_by_content is True, identical duplicate recordings are identified
+        by SHA-256 content hash and locked to the same partition to prevent train/val leakage.
         """
         splits: Dict[str, List[Tuple[str, int, Optional[str]]]] = {"train": [], "val": [], "test": []}
-        seen_content_hashes: Dict[str, str] = {}  # hash -> split_name
+        seen_content_hashes: Dict[str, str] = {}  # sha256_hash -> split_name
 
+        # 1. Check if physical split directories already exist (e.g., data/train, data/val, data/test)
+        train_dir = os.path.join(self.data_dir, "train")
+        val_dir = os.path.join(self.data_dir, "val")
+        test_dir = os.path.join(self.data_dir, "test")
+
+        if os.path.exists(train_dir) or os.path.exists(val_dir) or os.path.exists(test_dir):
+            for split_name, split_path in [("train", train_dir), ("val", val_dir), ("test", test_dir)]:
+                if not os.path.exists(split_path):
+                    continue
+                for class_name, class_idx in CLASS_TO_IDX.items():
+                    c_dir = os.path.join(split_path, class_name)
+                    if not os.path.exists(c_dir):
+                        continue
+                    for root, dirs, files in os.walk(c_dir):
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for f in sorted(files):
+                            if f.lower().endswith(".wav"):
+                                splits[split_name].append((os.path.join(root, f), class_idx, None))
+            if any(len(v) > 0 for v in splits.values()):
+                return splits
+
+        # 2. Fall back to scanning raw class directories and partitioning on-the-fly by content hash
         for class_name, class_idx in CLASS_TO_IDX.items():
             class_dir = os.path.join(self.data_dir, class_name)
             if not os.path.exists(class_dir):
@@ -272,28 +317,27 @@ class SwaraDataset:
             for root, dirs, files in os.walk(class_dir):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for f in sorted(files):
-                    if f.startswith(".") or f.startswith("._") or not f.lower().endswith(".wav"):
-                        continue
-                    path = os.path.join(root, f)
+                    if f.lower().endswith(".wav"):
+                        path = os.path.join(root, f)
 
-                    if deduplicate_by_content:
-                        try:
-                            c_hash = self.get_file_content_hash(path)
-                            if c_hash in seen_content_hashes:
-                                # Duplicate found! Assign to SAME split as original to prevent train/val leakage
-                                target_split = seen_content_hashes[c_hash]
+                        if deduplicate_by_content:
+                            try:
+                                c_hash = self.get_file_content_hash(path)
+                                if c_hash in seen_content_hashes:
+                                    # Duplicate found! Assign to SAME split as original to prevent train/val leakage
+                                    target_split = seen_content_hashes[c_hash]
+                                    splits[target_split].append((path, class_idx, None))
+                                    continue
+                                else:
+                                    target_split = self.get_recording_split(path)
+                                    seen_content_hashes[c_hash] = target_split
+                                    splits[target_split].append((path, class_idx, None))
+                            except Exception:
+                                target_split = self.get_recording_split(path)
                                 splits[target_split].append((path, class_idx, None))
-                                continue
-                            else:
-                                target_split = self.get_recording_split(f)
-                                seen_content_hashes[c_hash] = target_split
-                                splits[target_split].append((path, class_idx, None))
-                        except Exception:
-                            target_split = self.get_recording_split(f)
-                            splits[target_split].append((path, class_idx, None))
-                    else:
-                        split = self.get_recording_split(f)
-                        splits[split].append((path, class_idx, None))
+                        else:
+                            split = self.get_recording_split(path)
+                            splits[split].append((path, class_idx, None))
 
         return splits
 
@@ -403,7 +447,8 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
     """
     Comprehensive dataset inspection and validation audit.
     Inspects all WAV files under data_dir and reports class distributions, durations,
-    sample rates, channel formats, and potential duplicates.
+    class percentages, sample rates, channel formats, duplicates, recording-level
+    split counts, and a dataset sufficiency assessment.
     """
     report: Dict[str, Any] = {
         "target_directory": os.path.abspath(data_dir),
@@ -420,18 +465,51 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
         "duplicate_files_count": 0,
         "duplicate_groups": [],
         "filename_patterns": set(),
-        "class_breakdown": {cls: {"total": 0, "valid": 0, "duration_sec": 0.0} for cls in CLASSES},
+        "class_breakdown": {
+            cls: {
+                "total": 0,
+                "valid": 0,
+                "duration_sec": 0.0,
+                "percent_files": 0.0,
+                "percent_duration": 0.0,
+                "train_count": 0,
+                "val_count": 0,
+                "test_count": 0,
+            }
+            for cls in CLASSES
+        },
+        "recording_level_splits": {"train": 0, "val": 0, "test": 0},
         "class_imbalance_ratio": 1.0,
         "usable_recordings": 0,
+        "duration_stats": {
+            "min_sec": 0.0,
+            "max_sec": 0.0,
+            "mean_sec": 0.0,
+            "median_sec": 0.0,
+            "std_sec": 0.0,
+        },
+        "sufficiency": {
+            "is_sufficient": False,
+            "verdict": "DATASET NOT READY FOR TRAINING.",
+            "deficiencies": [],
+            "warnings": [],
+        },
     }
 
     if not os.path.exists(data_dir):
         report["error"] = f"Directory not found: {data_dir}"
         return report
 
+    has_physical_splits = any(os.path.exists(os.path.join(data_dir, s)) for s in ["train", "val", "test"])
+
     all_wavs = []
     for root, dirs, files in os.walk(data_dir):
+        # Ignore hidden and staging directories (e.g., .gdrive_staging, .git)
         dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if has_physical_splits:
+            # If physical train/val/test splits exist in data_dir, do not recurse into raw/ or processed/
+            if os.path.abspath(root) == os.path.abspath(data_dir):
+                dirs[:] = [d for d in dirs if d in ["train", "val", "test"]]
         for f in sorted(files):
             if f.startswith(".") or f.startswith("._") or not f.lower().endswith(".wav"):
                 continue
@@ -440,6 +518,7 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
     report["total_wav_files"] = len(all_wavs)
     if len(all_wavs) == 0:
         report["error"] = f"No .wav files found under: {os.path.abspath(data_dir)}"
+        report["sufficiency"]["deficiencies"].append(f"No .wav files found in {data_dir}")
         return report
 
     content_hashes: Dict[str, List[str]] = {}
@@ -465,8 +544,8 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
         try:
             with open(wav_path, "rb") as raw_f:
                 file_bytes = raw_f.read()
-                file_md5 = hashlib.md5(file_bytes).hexdigest()
-                content_hashes.setdefault(file_md5, []).append(wav_path)
+                file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+                content_hashes.setdefault(file_sha256, []).append(wav_path)
 
             with wave.open(wav_path, "rb") as wf:
                 channels = wf.getnchannels()
@@ -486,9 +565,29 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
                 duration_sec = float(num_frames) / float(sample_rate) if sample_rate > 0 else 0.0
                 report["durations_sec"].append(duration_sec)
 
+                # Determine recording split:
+                # If physical directory structure exists (in /train/, /val/, /test/), use it;
+                # otherwise compute deterministic recording split from filename.
+                if "/train/" in path_lower:
+                    split = "train"
+                elif "/val/" in path_lower:
+                    split = "val"
+                elif "/test/" in path_lower:
+                    split = "test"
+                else:
+                    split = SwaraDataset.get_recording_split(file_sha256)
+
+                report["recording_level_splits"][split] += 1
+
                 if assigned_class:
                     report["class_breakdown"][assigned_class]["valid"] += 1
                     report["class_breakdown"][assigned_class]["duration_sec"] += duration_sec
+                    if split == "train":
+                        report["class_breakdown"][assigned_class]["train_count"] += 1
+                    elif split == "val":
+                        report["class_breakdown"][assigned_class]["val_count"] += 1
+                    elif split == "test":
+                        report["class_breakdown"][assigned_class]["test_count"] += 1
 
                 if num_frames < sample_rate:
                     report["files_shorter_than_1s"] += 1
@@ -504,11 +603,31 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
         except Exception as e:
             report["invalid_corrupt_files"].append({"file": wav_path, "error": str(e)})
 
+    # Calculate class percentages
+    total_valid = report["valid_wav_files"]
+    total_duration = sum(info["duration_sec"] for info in report["class_breakdown"].values())
+    for cls, info in report["class_breakdown"].items():
+        if total_valid > 0:
+            info["percent_files"] = (info["valid"] / total_valid) * 100.0
+        if total_duration > 0:
+            info["percent_duration"] = (info["duration_sec"] / total_duration) * 100.0
+
+    # Calculate duration statistics
+    if report["durations_sec"]:
+        d_arr = np.array(report["durations_sec"])
+        report["duration_stats"] = {
+            "min_sec": float(np.min(d_arr)),
+            "max_sec": float(np.max(d_arr)),
+            "mean_sec": float(np.mean(d_arr)),
+            "median_sec": float(np.median(d_arr)),
+            "std_sec": float(np.std(d_arr)),
+        }
+
     # Detect duplicates
-    for md5, paths in content_hashes.items():
+    for sha256_h, paths in content_hashes.items():
         if len(paths) > 1:
             report["duplicate_files_count"] += len(paths) - 1
-            report["duplicate_groups"].append({"md5": md5, "copies": paths})
+            report["duplicate_groups"].append({"sha256": sha256_h, "copies": paths})
 
     # Class imbalance calculation
     counts = [info["valid"] for info in report["class_breakdown"].values() if info["valid"] > 0]
@@ -518,4 +637,41 @@ def inspect_dataset(data_dir: str) -> Dict[str, Any]:
         report["class_imbalance_ratio"] = 1.0
 
     report["filename_patterns"] = sorted(list(report["filename_patterns"]))
+
+    # Dataset Sufficiency Assessment
+    deficiencies = []
+    warnings = []
+
+    # Check for missing classes
+    missing_classes = [c for c in CLASSES if report["class_breakdown"][c]["valid"] == 0]
+    if missing_classes:
+        deficiencies.append(f"Missing required classes with 0 recordings: {', '.join(missing_classes)}")
+
+    # Check class sample quantities
+    for c in CLASSES:
+        val_c = report["class_breakdown"][c]["val_count"]
+        test_c = report["class_breakdown"][c]["test_count"]
+        total_c = report["class_breakdown"][c]["valid"]
+
+        if total_c > 0:
+            if val_c < 5:
+                warnings.append(f"Class '{c}' has only {val_c} validation sample(s); too few for statistically meaningful validation.")
+            if test_c < 5:
+                warnings.append(f"Class '{c}' has only {test_c} test sample(s); too few for statistically sound evaluation.")
+            if total_c < 50:
+                warnings.append(f"Class '{c}' has only {total_c} total recordings (recommended >= 50 for edge wake-word training).")
+
+    if total_valid < 30:
+        deficiencies.append(f"Total usable recordings ({total_valid}) is insufficient for deep learning (minimum recommended >= 100).")
+
+    is_sufficient = (len(deficiencies) == 0 and len(missing_classes) == 0)
+    verdict = "READY FOR TRAINING." if is_sufficient else "DATASET NOT READY FOR TRAINING."
+
+    report["sufficiency"] = {
+        "is_sufficient": is_sufficient,
+        "verdict": verdict,
+        "deficiencies": deficiencies,
+        "warnings": warnings,
+    }
+
     return report

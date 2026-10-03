@@ -15,6 +15,7 @@ Verifies:
 
 import os
 import sys
+import shutil
 import tempfile
 import unittest
 import numpy as np
@@ -202,6 +203,56 @@ class TestSwaraTrainingInfrastructure(unittest.TestCase):
         self.assertGreaterEqual(report_fixtures["valid_wav_files"], 3)
         self.assertGreaterEqual(report_fixtures["usable_recordings"], 3)
         self.assertIn("class_breakdown", report_fixtures)
+
+    def test_11_same_audio_different_filenames_same_partition(self):
+        """
+        M5 Regression Test:
+        Prove that two byte-identical WAV files with completely different filenames
+        are guaranteed to end up in the exact same partition (train/val/test), and
+        that changing a filename without changing the audio does not cause the
+        recording to move across partitions.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src_fixture = os.path.join(self.fixture_dir, "swara", "swara_01.wav")
+            with open(src_fixture, "rb") as f:
+                content = f.read()
+
+            # Create multiple files with different filenames but identical audio content
+            path_a = os.path.join(temp_dir, "recording_alpha_001.wav")
+            path_b = os.path.join(temp_dir, "completely_different_name_999.wav")
+            path_c = os.path.join(temp_dir, "user_renamed_audio.wav")
+
+            with open(path_a, "wb") as fa:
+                fa.write(content)
+            with open(path_b, "wb") as fb:
+                fb.write(content)
+            with open(path_c, "wb") as fc:
+                fc.write(content)
+
+            split_a = SwaraDataset.get_recording_split(path_a)
+            split_b = SwaraDataset.get_recording_split(path_b)
+            split_c = SwaraDataset.get_recording_split(path_c)
+
+            self.assertEqual(split_a, split_b, "Identical audio with different names must receive identical partition!")
+            self.assertEqual(split_b, split_c, "Renaming an audio file must not alter its partition!")
+
+            # Verify in full dataset scanner
+            test_data_dir = os.path.join(temp_dir, "test_dataset")
+            swara_dir = os.path.join(test_data_dir, "swara")
+            os.makedirs(swara_dir, exist_ok=True)
+            shutil.copy2(path_a, os.path.join(swara_dir, "orig.wav"))
+            shutil.copy2(path_b, os.path.join(swara_dir, "copy_with_different_name.wav"))
+
+            ds = SwaraDataset(test_data_dir)
+            splits = ds.scan_dataset(deduplicate_by_content=True)
+
+            assigned_splits = []
+            for s_name, entries in splits.items():
+                for p, _, _ in entries:
+                    assigned_splits.append(s_name)
+
+            self.assertEqual(len(assigned_splits), 2)
+            self.assertEqual(assigned_splits[0], assigned_splits[1], "Both duplicate files must be in the same partition!")
 
 
 if __name__ == "__main__":
